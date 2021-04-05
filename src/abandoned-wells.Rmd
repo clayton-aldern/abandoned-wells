@@ -1,0 +1,1835 @@
+---
+title: "Predicting oil and gas well abandonment"
+author: "Clayton Aldern for Grist / The Texas Observer"
+subtitle: An analysis of Texas and New Mexico energy infrastructure
+date: "March 2021"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    df_print: paged
+    highlight: kate
+    toc: yes
+    toc_float: yes
+  github_document:
+    df_print: paged
+    pandoc_args: --webtex
+    toc: yes
+assets:
+  css:
+  - http://fonts.googleapis.com/css?family=Raleway
+  - http://fonts.googleapis.com/css?family=Merriweather
+always_allow_html: yes
+---
+<style>
+body{
+  font-family: 'Merriweather', sans-serif;
+  font-size: 16px;
+  line-height: 24px;
+}
+
+h1,h2,h3,h4 {
+  font-family: 'Raleway', sans-serif;
+}
+</style>
+---
+
+At the end of a given oil or gas well’s productive life in the Permian Basin, regulators in Texas and New Mexico move it onto a state list of *inactive wells*. Oil companies are legally required to “plug” inactive wells to prevent leaks. Drilling a well involves puncturing through layers of dirt, rock, and water to reach oil and gas deposits. The walls of the well are reinforced with steel and cement casing, but as they age—or if they were improperly drilled—cracks may form in the cement and the casings could corrode. This increases the risk of methane seeping into the air and oil migrating into the surrounding groundwater. For this reason, an operator is supposed to plug a spent well by pouring concrete into the well and also clean up the surrounding area by removing well heads, tanks, pipes, and other unused equipment that could endanger humans or wildlife.  
+\  
+Operators don’t always do so. Whether via bankruptcy declarations or through a variety of legal mechanisms, some producers merely walk away from their inactive wells, effectively abandoning them. These *abandoned wells* (about 7 percent of inactive wells) are ultimately plugged by the state—often at the expense of the taxpayer. Grist and The Texas Observer have recently completed an investigation into the dynamics of oil and gas well abandonment in Texas and New Mexico. Part of the premise asserted by this investigation is that the states’ definitions of an abandoned well per se constitute arbitrary distinctions, as many inactive wells on the states’ lists have been inactive for years—and ought to be plugged. As part of this investigation, we have produced a set of complementary statistical models to estimate the number of wells in Texas and New Mexico that are likely to be abandoned in the coming years (or, indeed, are already abandoned in a colloquial sense but have yet to meet the states’ definitions of abandonment, which often depend on a given well’s operator reaching a certain delinquency criterion in terms of its organizational standing with regulators). The goal of the modeling exercise is to determine additional wells that ought to be considered abandoned—or will soon meet the states’ definitions—and, in turn, estimate the cost the states will likely have to shoulder in the future.  
+\  
+*Statistically, we consider the problem of differentiating between inactive wells and abandoned wells to be a classification problem with a partially mislabeled training set.* That is, we assume that inactive wells and abandoned wells will be largely separable, but upon cross-validating a model, we expect a small proportion of wells labeled by the states as “inactive” to be statistically indistinguishable from wells they’ve labeled as “abandoned” (and thus inappropriately classified by the model). To control for underfitting, we conduct a series of pre and post hoc analyses on the two classes and the candidate mislabeled examples to understand the manners in which they do or do not differ from distributions of state-labeled inactive and abandoned wells. Assuming these misclassified samples differ from ground-truth abandoned wells exclusively in a manner that maps onto the states’ definitions of abandonment, we can conclude these wells ought to be considered abandoned—but that the states’ definitions protect them from such a fate. To control for overfitting, we perform a series of cross-validation and variable selection routines (described below).  
+\  
+To build our datasets, we join the states’ official inactive well lists (a subset of which are already considered abandoned) to a set of data on wells and well operators gathered from agency, state, and federal sources. To collect this information, we filed public-records requests with the Texas Railroad Commission and the New Mexico Oil Conservation Division and queried public databases from the Texas Workforce Commission, Texas Real Estate Research Center, New Mexico Workforce Connection, and the Federal Reserve. Each row in the final datasets (roughly 100,000 rows for Texas and 4,500 rows for New Mexico) contains a unique inactive well, each of which is characterized by variables like its type (oil or gas), depth, age, oversight district, projected plugging cost, and history of operation, inspections, and violations. To help determine the likelihood of abandonment, we also considered aggregate control variables like interest rates, county populations, unemployment rates, oil- and gas- firm counts, and normalized gas and oil prices at the initial date of well inactivity. Due to differences in variable availability—enforcement data were easier to come by in Texas, for example—we build a separate model for each state. Let's get into it.
+
+## Setup
+```{r, setup, message=FALSE}
+options(warn=-1)
+setwd("~/Developer/gristy/abandoned-wells/src")
+
+library(tidyverse)
+# library(plyr)
+library(stats)
+library(gtsummary)
+library(alpaca)
+library(survival)
+library(glmnet)
+library(glmnetUtils)
+library(zoo)
+library(lubridate)
+library(DT)
+library(survminer)
+```
+### Load and format data
+
+We'll start with Texas. If you do a bunch of scrolling, you'll find the New Mexico replication further down.
+```{r, load small files, warning=FALSE}
+macro <- read.csv('../data/macro.csv')
+unemployment <- read.csv('../data/TX/county/unemployment.csv')
+pop <- read.csv('../data/TX/county/county-population.csv')
+wages <- read.csv('../data/TX/county/wages-employment.csv')
+mappings <- read.csv('../data/TX/county/mappings.csv')
+inspections <- read.csv('../data/TX/well/ic.csv',
+                        stringsAsFactors = FALSE)
+violations <- read.csv('../data/TX/well/vc.csv',
+                       stringsAsFactors = FALSE)
+inactive <- read.csv('../data/TX/well/IWAR_20201003.csv',
+                     stringsAsFactors = FALSE)
+operators <- read.csv('../data/TX/operator/operator.csv',
+                     stringsAsFactors = FALSE)
+
+# function to ensure API and lease IDs are the same length (and left-padded with zeros)
+frmt <- function(d,c,m){ # data, column name, max length
+  f <- paste0("%0",m,"d")
+  t <- sprintf(f, as.integer(d[,c]))
+  frmtNA <- paste0(strrep("0",m-2),"NA")
+  t[t==frmtNA] <- NA
+  return(t)
+}
+
+inactive$District.Code <- str_pad(inactive$District.Code,
+                                  width=2,
+                                  side="left",
+                                  pad="0")
+
+operators$Operator.Number <- frmt(operators,"Operator.Number",6)
+inactive$Operator.Number <- frmt(inactive,"Operator.Number",6)
+
+inspections$API_NO <- frmt(inspections,"API_NO",8)
+violations$API_NO <- frmt(violations,"API_NO",8)
+inactive$API <- frmt(inactive,"API",8)
+
+## Inconsistent leading zeros on lease IDs across datasets will force us to lose some uniqueness here
+## We'll recover the uniqueness by creating a new key with district codes
+inspections$OIL_LEASE_GAS_WELL_ID <- frmt(inspections,"OIL_LEASE_GAS_WELL_ID",6)
+violations$OIL_LEASE_GAS_WELL_ID <- frmt(violations,"OIL_LEASE_GAS_WELL_ID",6)
+inactive$Lease.Number <- frmt(inactive,"Lease.Number",6)
+
+inspections$LEASE <- paste0(inspections$DISTRICT,
+                            "-",
+                            inspections$OIL_LEASE_GAS_WELL_ID)
+violations$LEASE <- paste0(violations$DISTRICT,
+                           "-",
+                           violations$OIL_LEASE_GAS_WELL_ID)
+inactive$LEASE <- paste0(inactive$District.Code,
+                         "-",
+                         inactive$Lease.Number)
+
+nInactive <- n_distinct(inactive$API)
+nAbandoned <- n_distinct(inactive[inactive$Is.Orphan.==TRUE,]$API)
+
+wages <- wages %>% filter(Industry=="Total, All Industries")
+unemployment$Area <- unemployment$Area %>% trimws()
+wu <- unemployment %>% merge(wages,
+                      by=c("Year","Area"),
+                      all.x=TRUE)
+pop$County <- str_replace(pop$County, " County", "") %>% as.factor()
+wup <- wu %>% merge(pop,
+                    by.x = c("Area","Year"),
+                    by.y = c("County","Year"),
+                    all.x = TRUE)
+wup <- wup %>% filter(Area.Type=="County")
+wup <- wup %>% select(Year,
+                      Area,
+                      Firms,
+                      Average.Weekly.Wage,
+                      Unemployment.Rate,
+                      Population,
+                      Population.Change)
+wup$Area <- as.factor(wup$Area)
+wup$Firms <- as.integer(wup$Firms)
+wup$Average.Weekly.Wage <- as.integer(wup$Average.Weekly.Wage)
+wup <- wup[!duplicated(wup[c(1,2)]),]
+
+macro$date <- as.Date(macro$date, "%m/%d/%y")
+macro$Year <- format(macro$date,"%Y") %>% as.integer()
+macroAll <- wup %>% merge(macro,
+                          by = "Year",
+                          all.x = TRUE) # unique rows are county-month pairs
+
+mappings$CC <- mappings$CC %>% as.integer()
+```
+The state's inactive wells report lists `r nInactive` wells, `r nAbandoned` of which are abandoned (as per the state's definition). Part of our goal here is going to be to attempt to differentiate between the wells that end up abandoned and those that don't. Next, we'll load in historical production data. There's a lot of it, so we should probably preallocate some memory.
+```{r, load big files, cache=TRUE}
+preAllocate <- system("wc -l ../data/TX/lease/PDQ/OG_LEASE_CYCLE_DATA_TABLE.dsv",
+                      intern = TRUE) %>%
+  sub("(\\d+).*","\\1",.) %>% 
+  as.numeric()
+
+leases <- read.table('../data/TX/lease/PDQ/OG_LEASE_CYCLE_DATA_TABLE.dsv',
+                     sep = '}',
+                     quote = "",
+                     header = TRUE,
+                     row.names = NULL,
+                     na.strings = "",
+                     colClasses = c("factor",
+                                    "factor",
+                                    "character",
+                                    "factor",
+                                    "factor",
+                                    "factor",
+                                    "character",
+                                    "character",
+                                    "character",
+                                    "character",
+                                    "character",
+                                    "character",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "integer",
+                                    "character",
+                                    "character",
+                                    "character",
+                                    "character"),
+                     nrows = preAllocate,
+                     strip.white = TRUE,
+                     blank.lines.skip = TRUE,
+                     allowEscapes = FALSE,
+                     fill = TRUE)
+
+# take a peek at the lease data
+glimpse(leases)
+```
+Great! Since we're only going to model inactive versus abandoned wells, let's subset the files (especially the huge one; we'll thank ourselves later). Without subsetting the lease dataset, we'd be talking about well more than 100 million rows ... and probably approaching distributed or cloud computing territory. Let's see how much we can ram through (so to speak) on our Grist-issue MacBook Air.
+```{r, subset, cache=TRUE}
+apiList <- unique(inactive$API) # 99,198 entries
+leaseList <- unique(inactive$LEASE) # 57,386 entries
+
+leases$LEASE_NO <- frmt(leases,"LEASE_NO",6)
+leases$LEASE <- paste0(leases$DISTRICT_NAME,
+                         "-",
+                         leases$LEASE_NO)
+
+# instead of getting too fancy and looking at the production curves
+# just get a sense of lifetime ownership (hand-switching) and cumulative production
+leases <- leases %>% group_by(LEASE_NO_DISTRICT_NO) %>% 
+  mutate(nOperators = n_distinct(OPERATOR_NO)) %>% ungroup()
+leases <- leases %>% group_by(LEASE_NO_DISTRICT_NO, OPERATOR_NO) %>% 
+  mutate(sumOil = sum(LEASE_OIL_PROD_VOL)) %>% ungroup()
+leases <- leases %>% group_by(LEASE_NO_DISTRICT_NO, OPERATOR_NO) %>% 
+  mutate(sumGas = sum(LEASE_GAS_PROD_VOL)) %>% ungroup()
+
+# overwrite during the subsets to save memory:
+inspections <- inspections %>% subset(API_NO %in% apiList) # 186,324 rows
+violations <- violations %>% subset(API_NO %in% apiList) # 39,475 rows
+leases <- leases %>% subset(LEASE %in% leaseList) # 7,955,205 rows
+
+nWithInspections <- n_distinct(inspections$API_NO)
+nWithViolations <- n_distinct(violations$API_NO)
+nLeases <- n_distinct(leases$LEASE)
+
+leasesAgg <- leases %>% select(OIL_GAS_CODE,
+                               OPERATOR_NO,
+                               LEASE,
+                               nOperators,
+                               sumOil,
+                               sumGas) %>% unique()
+
+rm(macro)
+rm(pop)
+rm(unemployment)
+rm(wages)
+rm(wu)
+rm(wup)
+rm(leases)
+
+# save the .Rdata file so you don't have to load the big stuff in ever again
+# save.image('../data/tx-datasets.RData')
+```
+So: All told, we'll be working with `r nInactive` wells spread across `r nLeases` leases in Texas. `r nWithInspections` of these wells have inspection histories, and `r nWithViolations` of them have violation histories. 
+
+## Exploratory analysis
+
+Before we begin modeling, we'll visually assess some of the relationships between the variables in question.
+
+### Visualize some distributions
+
+Let's start by taking a peek at the relationship between orphan status and well depth.
+```{r, dist1, fig.height=4, fig.width=6, warning=FALSE}
+muDepth <- plyr::ddply(inactive,
+                 "Is.Orphan.",
+                 summarise,
+                 grp.med=median(API.Depth,
+                                na.rm=TRUE))
+
+ggplot(inactive, aes(API.Depth,
+                     fill=Is.Orphan.,
+                     color=Is.Orphan.)) + 
+  labs(fill="Orphan Status") +
+  geom_density(alpha=0.3,
+               adjust=1.3) +
+  geom_vline(data=muDepth,
+             aes(xintercept=grp.med,
+                 color=Is.Orphan.),
+             linetype="dashed",
+             size=1) +
+  guides(color=FALSE) +
+  xlab("Well Depth (feet)") +
+  ylab("Density")
+```
+\  
+That's kind of interesting. Seems like there's a pretty long tail here, but broadly speaking, it looks like orphaned wells tend to be a bit shallower than merely inactive wells, all else equal.
+```{r, dist2, fig.height=4, fig.width=6, warning=FALSE}
+inactive$inactiveTotalMonths <- (inactive$Current.Inactive.Years * 12) + inactive$Current.Inactive.Months
+muInactiveMonths <- plyr::ddply(inactive,
+                          "Is.Orphan.",
+                          summarise,
+                          grp.med=median(inactiveTotalMonths,
+                                         na.rm=TRUE))
+
+ggplot(inactive,
+       aes(inactiveTotalMonths,
+           fill=Is.Orphan.,
+           color=Is.Orphan.)) +
+  labs(fill="Orphan Status") +
+  geom_density(alpha=0.3,
+               adjust=0.7) +
+  geom_vline(data=muInactiveMonths,
+             aes(xintercept=grp.med,
+                 color=Is.Orphan.),
+             linetype="dashed",
+             size=1) +
+  guides(color=FALSE) +
+  xlab("Inactive Time (Months)") +
+  ylab("Density")
+```
+\  
+While the big spike near the end of the distribution is probably a database artifact, the broadly overlapping distributions suggest that a bunch of inactive wells have indeed been inactive for just as long as their orphaned peers—and perhaps ought to be considered as such. More on that later...
+```{r, dist3, fig.height=4, fig.width=6, warning=FALSE}
+inactive$Original.Completion.Date <- as.Date(as.character(inactive$Original.Completion.Date),
+                                             "%Y%m%d")
+
+muOriginalCompletion <- plyr::ddply(inactive,
+                              "Is.Orphan.",
+                              summarise,
+                              grp.med=median(Original.Completion.Date,
+                                             na.rm=TRUE))
+
+ggplot(inactive,
+       aes(Original.Completion.Date,
+           fill=Is.Orphan.,
+           color=Is.Orphan.)) +
+  labs(fill="Orphan Status") +
+  geom_density(alpha=0.3,
+               adjust=1) +
+  geom_vline(data=muOriginalCompletion,
+             aes(xintercept=grp.med,
+                 color=Is.Orphan.),
+             linetype="dashed",
+             size=1) +
+  guides(color=FALSE) +
+  xlab("Original Completion Date") +
+  ylab("Density")
+```
+\  
+(Also probably unsurprising.)
+```{r, inspection counts}
+regCounts <- data.frame(API = apiList)
+iC <- plyr::count(inspections,
+            vars = "API_NO")
+vC <- plyr::count(violations,
+            vars = "API_NO")
+regCounts <- regCounts %>% merge(iC,
+                                 by.x = "API",
+                                 by.y = "API_NO",
+                                 all.x = TRUE)
+regCounts <- regCounts %>% merge(vC,
+                                 by.x = "API",
+                                 by.y = "API_NO",
+                                 all.x = TRUE)
+colnames(regCounts) <- c("API",
+                         "inspectionCount",
+                         "violationCount")
+regCounts[is.na(regCounts)] <- 0
+
+dI <- inactive %>% merge(regCounts,
+                         by = "API",
+                         all.x = TRUE)
+
+muiC <- plyr::ddply(dI,
+              "Is.Orphan.",
+              summarise,
+              grp.med=median(inspectionCount,
+                             na.rm=TRUE))
+
+ggplot(dI,
+       aes(inspectionCount,
+           fill=Is.Orphan.,
+           color=Is.Orphan.)) +
+  labs(fill="Orphan Status") +
+  geom_density(alpha=0.3,
+               adjust=6) +
+  geom_vline(data=muiC,
+             aes(xintercept=grp.med,
+                 color=Is.Orphan.),
+             linetype="dashed",
+             size=1) +
+  guides(color=FALSE) +
+  xlab("Inspection Count") +
+  ylab("Density")
+```
+```{r, violation counts}
+muvC <- plyr::ddply(dI,
+              "Is.Orphan.",
+              summarise,
+              grp.med=median(violationCount,
+                             na.rm=TRUE))
+
+ggplot(dI,
+       aes(violationCount,
+           fill=Is.Orphan.,
+           color=Is.Orphan.)) +
+  labs(fill="Orphan Status") +
+  geom_density(alpha=0.3,
+               adjust=6) +
+  geom_vline(data=muvC,
+             aes(xintercept=grp.med,
+                 color=Is.Orphan.),
+             linetype="dashed",
+             size=1) +
+  guides(color=FALSE) +
+  xlab("Violation Count") +
+  ylab("Density")
+```
+\  
+We'll deal with those tails later. In the meantime, let's finish cleaning the dataset, transform a couple variables, and look at a basic logistic regression.
+
+### Unregularized models
+```{r, clean logistic model}
+dI <- dI %>% merge(operators,
+                   by = "Operator.Number",
+                   all.x = TRUE)
+
+macroAll$Area <- tolower(macroAll$Area) %>% trimws() %>% as.factor()
+mappings$County <- tolower(mappings$County) %>% trimws() %>% as.factor()
+dI$County.Name <- tolower(dI$County.Name) %>% trimws() %>% as.factor()
+
+macroAll <- macroAll %>% merge(mappings,
+                                by.x = "Area",
+                                by.y = "County",
+                                all.x = TRUE)
+
+dI <- dI %>% merge(leasesAgg,
+                   by.x = c("LEASE","Operator.Number"),
+                   by.y = c("LEASE","OPERATOR_NO"),
+                   all.x = TRUE)
+# pre-inactivity dates
+dI$inactiveDate <- as.Date("2020/10/01") %m-% months(dI$inactiveTotalMonths)
+dI$inactiveDate3 <- dI$inactiveDate %m-% months(3)
+dI$inactiveDate6 <- dI$inactiveDate %m-% months(6)
+dI$inactiveDate12 <- dI$inactiveDate %m-% months(12)
+dI$inactiveDate18 <- dI$inactiveDate %m-% months(18)
+dI$inactiveDate24 <- dI$inactiveDate %m-% months(24)
+# post-inactivity dates (we label 'p')
+dI$inactiveDate3p <- dI$inactiveDate %m+% months(3)
+dI$inactiveDate6p <- dI$inactiveDate %m+% months(6)
+dI$inactiveDate12p <- dI$inactiveDate %m+% months(12)
+
+rn <- function(d,t,s){ # data, tail extent, suffix
+  colnames(d) <- c(head(colnames(d),length(colnames(d))-t),
+                  paste0(tail(colnames(d),t),".",s))
+  return(d)
+}
+# hard-coding in the renaming tail extent for now
+renames <- 12
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"current")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate3","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"3")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate6","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"6")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate12","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"12")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate18","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"18")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate24","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"24")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate3p","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"3p")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate6p","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"6p")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate12p","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"12p")
+# guess we could have done that with a function, huh
+
+# some normalized variables for testing later
+dI <- dI %>% mutate(totprod = scale(sumOil)+scale(sumGas))
+dI <- dI %>% mutate(normcommod.current = ifelse(O.G.Code=="O",scale(wti.price.current),scale(ng.price.current)))
+dI <- dI %>% mutate(normcommod.3 = ifelse(O.G.Code=="O",scale(wti.price.3),scale(ng.price.3)))
+dI <- dI %>% mutate(normcommod.6 = ifelse(O.G.Code=="O",scale(wti.price.6),scale(ng.price.6)))
+dI <- dI %>% mutate(normcommod.12 = ifelse(O.G.Code=="O",scale(wti.price.12),scale(ng.price.12)))
+dI <- dI %>% mutate(normcommod.18 = ifelse(O.G.Code=="O",scale(wti.price.18),scale(ng.price.18)))
+dI <- dI %>% mutate(normcommod.24 = ifelse(O.G.Code=="O",scale(wti.price.24),scale(ng.price.24)))
+dI <- dI %>% mutate(normcommod.3p = ifelse(O.G.Code=="O",scale(wti.price.3p),scale(ng.price.3p)))
+dI <- dI %>% mutate(normcommod.6p = ifelse(O.G.Code=="O",scale(wti.price.6p),scale(ng.price.6p)))
+dI <- dI %>% mutate(normcommod.12p = ifelse(O.G.Code=="O",scale(wti.price.12p),scale(ng.price.12p)))
+
+dI <- droplevels(dI)
+rownames(dI) <- NULL
+dI <- dI %>% select(
+                    API,
+                    Operator.Number,
+                    County.Name,
+                    O.G.Code,
+                    District.Code,
+                    # LEASE,
+                    # Field.Number,
+                    Water.Land.Code,
+                    API.Depth,
+                    Shut.In.Date,
+                    Extension.Status,
+                    Cost.Calculation,
+                    Well.Plugged,
+                    Original.Completion.Date,
+                    Is.Orphan.,
+                    inactiveTotalMonths,
+                    inspectionCount,
+                    violationCount,
+                    Org.P5.Status,
+                    Org.Type,
+                    Mailing.Address.State,
+                    Initial.P5.Filed.Date,
+                    Last.P5.Filed.Date,
+                    Expiration.Date,
+                    P5.Inactive.Date,
+                    FA.Option,
+                    FA.Amount,
+                    FA.Type,
+                    nOperators,
+                    sumOil,
+                    sumGas,
+                    totprod,
+                    Firms.current,
+                    Average.Weekly.Wage.current,
+                    Unemployment.Rate.current,
+                    Population.current,
+                    Population.Change.current,
+                    wti.price.current,
+                    ng.price.current,
+                    interest.rate.current,
+                    interest.rate.change.current,
+                    wti.price.3,
+                    ng.price.3,
+                    wti.price.6,
+                    ng.price.6,
+                    wti.price.12,
+                    ng.price.12,
+                    wti.price.18,
+                    ng.price.18,
+                    wti.price.24,
+                    ng.price.24,
+                    interest.rate.12,
+                    interest.rate.change.12,
+                    interest.rate.18,
+                    interest.rate.change.18,
+                    interest.rate.24,
+                    interest.rate.change.24,
+                    wti.price.3p,
+                    ng.price.3p,
+                    wti.price.6p,
+                    ng.price.6p,
+                    wti.price.12p,
+                    ng.price.12p,
+                    interest.rate.6p,
+                    interest.rate.change.6p,
+                    interest.rate.12p,
+                    interest.rate.change.12p,
+                    Firms.12,
+                    Average.Weekly.Wage.12,
+                    Unemployment.Rate.12,
+                    Population.12,
+                    Population.Change.12,
+                    Firms.24,
+                    Average.Weekly.Wage.24,
+                    Unemployment.Rate.24,
+                    Population.24,
+                    Population.Change.24,
+                    Firms.12p,
+                    Average.Weekly.Wage.12p,
+                    Unemployment.Rate.12p,
+                    Population.12p,
+                    Population.Change.12p,
+                    normcommod.current,
+                    normcommod.3,
+                    normcommod.6,
+                    normcommod.12,
+                    normcommod.18,
+                    normcommod.24,
+                    normcommod.3p,
+                    normcommod.6p,
+                    normcommod.12p
+                    )
+
+# helper selection stage in case we want to add/remove vars easily later
+dIs <- dI %>% select(Is.Orphan.,
+                     O.G.Code,
+                     District.Code,
+                     Water.Land.Code,
+                     # API,
+                     # Operator.Number,
+                     # County.Name,
+                     # LEASE,
+                     # Field.Number,
+                     API.Depth,
+                     Cost.Calculation,
+                     Well.Plugged,
+                     Original.Completion.Date,
+                     inactiveTotalMonths,
+                     inspectionCount,
+                     violationCount,
+                     Org.Type,
+                     Mailing.Address.State,
+                     Initial.P5.Filed.Date,
+                     Last.P5.Filed.Date,
+                     Expiration.Date,
+                     P5.Inactive.Date,
+                     FA.Option,
+                     FA.Amount,
+                     nOperators,
+                     # sumOil,
+                     # sumGas,
+                     # totprod,
+                     Firms.current,
+                     Average.Weekly.Wage.current,
+                     Unemployment.Rate.current,
+                     Population.current,
+                     Population.Change.current,
+                     # wti.price.current,
+                     # ng.price.current,
+                     interest.rate.current,
+                     interest.rate.change.current,
+                     # wti.price.3,
+                     # ng.price.3,
+                     # wti.price.6,
+                     # ng.price.6,
+                     # wti.price.12,
+                     # ng.price.12,
+                     # wti.price.18,
+                     # ng.price.18,
+                     # wti.price.24,
+                     # ng.price.24,
+                     interest.rate.12,
+                     interest.rate.change.12,
+                     interest.rate.18,
+                     interest.rate.change.18,
+                     interest.rate.24,
+                     interest.rate.change.24,
+                     # wti.price.3p,
+                     # ng.price.3p,
+                     # wti.price.6p,
+                     # ng.price.6p,
+                     # wti.price.12p,
+                     # ng.price.12p,
+                     interest.rate.6p,
+                     interest.rate.change.6p,
+                     interest.rate.12p,
+                     interest.rate.change.12p,
+                     Firms.12,
+                     Average.Weekly.Wage.12,
+                     Unemployment.Rate.12,
+                     Population.12,
+                     Population.Change.12,
+                     Firms.24,
+                     Average.Weekly.Wage.24,
+                     Unemployment.Rate.24,
+                     Population.24,
+                     Population.Change.24,
+                     Firms.12p,
+                     Average.Weekly.Wage.12p,
+                     Unemployment.Rate.12p,
+                     Population.12p,
+                     Population.Change.12p,
+                     normcommod.current,
+                     normcommod.3,
+                     normcommod.6,
+                     normcommod.12,
+                     normcommod.18,
+                     normcommod.24,
+                     normcommod.3p,
+                     normcommod.6p,
+                     normcommod.12p
+                     )
+
+# drop 668 plugged wells (comment out the next three lines to keep them in)
+dIs <- dIs[(dIs$Well.Plugged == "N"),]
+dIs <- droplevels(dIs)
+dIs <- dIs %>% select(-Well.Plugged)
+
+# deduplicate (there are a handful of wells that look identical)
+D <- dIs %>% unique()
+
+# D$Operator.Number <- as.factor(D$Operator.Number)
+D$O.G.Code <- as.factor(D$O.G.Code)
+D$District.Code <- as.factor(D$District.Code)
+D$Water.Land.Code <- as.factor(D$Water.Land.Code)
+D$Org.Type <- as.factor(D$Org.Type)
+D$Mailing.Address.State <- as.factor(D$Mailing.Address.State)
+D$FA.Option <- as.factor(D$FA.Option)
+
+D$completionYear <- format(D$Original.Completion.Date,'%Y')
+D$age <- round(as.numeric(difftime("2020-10-03",
+                                   D$Original.Completion.Date,
+                                   units="weeks")/52) # in years
+               ,3) 
+D <- D %>% select(-Original.Completion.Date)
+
+D$Last.P5.Filed.Date <- as.Date(D$Last.P5.Filed.Date,'%m/%d/%Y')
+D$Initial.P5.Filed.Date <- as.Date(D$Initial.P5.Filed.Date,'%m/%d/%Y')
+D$Expiration.Date <- as.Date(D$Expiration.Date,'%m/%d/%Y')
+D$P5.Inactive.Date <- as.Date(D$P5.Inactive.Date,'%m/%d/%Y')
+D$orgAge <- round(as.numeric(difftime(D$Last.P5.Filed.Date,
+                                      D$Initial.P5.Filed.Date,
+                                      units="weeks")/52) # in years
+               ,3) 
+D <- D %>% select(-c(Last.P5.Filed.Date,
+                     Initial.P5.Filed.Date))
+# D$orgDelinquentTotalMonths <- round(as.numeric(difftime("2020-10-03",
+#                                       D$Expiration.Date,
+#                                       units="weeks")/52) # in years
+#                ,3)*12 # in months
+D <- D %>% select(-c(Expiration.Date,
+                     P5.Inactive.Date
+                     ))
+
+D$Org.Type <- factor(D$Org.Type, levels = c(levels(D$Org.Type), "OTHER"))
+D[grepl('OTHER', as.character(D$Org.Type)),'Org.Type'] <- "OTHER"
+D <- droplevels(D)
+
+D$Mailing.Address.State <- factor(D$Mailing.Address.State, levels = c(levels(D$Mailing.Address.State), "OTHER"))
+D$Mailing.Address.State <- factor(ifelse(D$Mailing.Address.State=="TX","TX","OTHER"))
+
+# run a basic logistic regression
+m1 <-
+  glm(Is.Orphan. ~ .
+      - completionYear,
+      family = binomial(link = "logit"),
+      data = D)
+
+summary(m1)
+```
+Plenty to chew on here. Looks like there's a large effect of district. Let's take a closer look.
+```{r, district plot, fig.height=4, fig.width=6}
+tb <- table(D$Is.Orphan.,D$District.Code)
+tbc <- tb[2,]/(tb[2,]+tb[1,])
+tbdf <- data.frame(District = names(tbc),
+                   Proportion = tbc)
+ggplot(tbdf,
+       aes(reorder(District, Proportion),
+           Proportion)) + 
+  geom_col() + 
+  coord_flip()
+```
+\  
+Let's start fixing effects to understand those big geographic coefficients + differences.
+```{r, fixed effects}
+m1f <- feglm(Is.Orphan. ~ 
+               API.Depth +
+               Cost.Calculation +
+               age +
+               inactiveTotalMonths +
+               inspectionCount +
+               violationCount +
+               Org.Type +
+               Mailing.Address.State +
+               FA.Option +
+               FA.Amount +
+               nOperators +
+               # totprod +
+               # sumOil +
+               # sumGas +
+               Firms.current +
+               Average.Weekly.Wage.current +
+               Unemployment.Rate.current +
+               Population.current +
+               Population.Change.current +
+               # wti.price.current +
+               # ng.price.current +
+               interest.rate.current +
+               interest.rate.change.current +
+               # wti.price.3 +
+               # ng.price.3 +
+               # wti.price.6 +
+               # ng.price.6 +
+               # wti.price.12 +
+               # ng.price.12 +
+               # wti.price.18 +
+               # ng.price.18 +
+               # wti.price.24 +
+               # ng.price.24 +
+               interest.rate.12 +
+               interest.rate.change.12 +
+               interest.rate.18 +
+               interest.rate.change.18 +
+               interest.rate.24 +
+               interest.rate.change.24 +
+               # wti.price.3p +
+               # ng.price.3p +
+               # wti.price.6p +
+               # ng.price.6p +
+               # wti.price.12p +
+               # ng.price.12p +
+               normcommod.current +
+               normcommod.3 +
+               normcommod.6 +
+               normcommod.12 +
+               normcommod.18 +
+               normcommod.24 +
+               normcommod.3p +
+               normcommod.6p +
+               normcommod.12p +
+               interest.rate.6p +
+               interest.rate.change.6p +
+               interest.rate.12p +
+               interest.rate.change.12p +
+               Firms.12 +
+               Average.Weekly.Wage.12 +
+               Unemployment.Rate.12 +
+               Population.12 +
+               Population.Change.12 +
+               Firms.24 +
+               Average.Weekly.Wage.24 +
+               Unemployment.Rate.24 +
+               Population.24 +
+               Population.Change.24 +
+               Firms.12p +
+               Average.Weekly.Wage.12p +
+               Unemployment.Rate.12p +
+               Population.12p +
+               Population.Change.12p +
+               orgAge |
+               
+               District.Code + 
+               O.G.Code + 
+               Water.Land.Code + 
+               completionYear |
+               
+               District.Code,
+             data = D,
+             family = binomial(link="logit"))
+summary(m1f)
+```
+And just for reference, to make sure we're not overfitting off the bat, let's manually drop some of those vars (mostly controls and redundancies) as a means of variable selection:
+```{r, fixed effects trim}
+m2f <- feglm(Is.Orphan. ~ 
+               API.Depth +
+               age +
+               inactiveTotalMonths +
+               inspectionCount +
+               violationCount +
+               Org.Type +
+               Mailing.Address.State +
+               FA.Amount +
+               nOperators +
+               orgAge |
+               
+               District.Code + 
+               O.G.Code + 
+               Water.Land.Code + 
+               completionYear |
+               
+               District.Code,
+             data = D,
+             family = binomial(link="logit"))
+summary(m2f)
+```
+Okay. So it seems like there might be something there—looks like there's relevant variance both within and between regions—but it's important not to jump to conclusions. Right now, given no other information, we might say that wells considered abandoned (not merely inactive) have been inactive for longer, are more likely to be operated by sole proprietors, and have more violations on the books. Their operators are also younger and more likely to have mailing addresses outside of TX.
+\  
+At any rate, we've got a relatively large *n* and a relatively small difference in the underlying distributions we looked at (along with some correlated columns), so we want to make sure these effects are real.
+\  
+Ultimately, we're going to treat this effort as a kind of prediction task, but our assumption is that *some small percentage of our training examples are mislabeled*. (These cases represent the situation in which we're interested: that in which the state has not yet categorized an inactive well as abandoned, but our model thinks otherwise.) That is, we're going to try to build a good classifier, cross-validating and testing along the way, but at the end, we're going to take a close look at the model's "false positives" (in the eyes of the state) and ask what differentiates them from true positives and true negatives.  
+
+## Regularized model
+
+Given well descriptors, we're going to try to determine which, if any, factors are predictive of orphan status. We'll use the `glmnet` package to build an *elastic net* model, which, for the statisticians in the room, just adds a mixture of $\ell1$- and $\ell2$-regularizing terms to the logistic regression:  
+\
+$$\log \frac{p_{orphan}(x;\theta)}{p_{non-orphan}(x;\theta)} = \beta_0 + \beta^Tx;
+\\
+\max_{\beta_{0},\beta} 
+\left \{ 
+  \sum_{i=1}^{N} [y_i (\beta_0 + \beta^Tx_i) - 
+  \log(1 + e^{\beta_0 + \beta^Tx_i})]
+- \lambda \sum_{j=1}^{p}(\alpha |\beta_j| + (1 - \alpha)\beta^2_j)
+\right \},
+$$
+\
+where $\alpha$ is the mixing coefficient. At one extreme, elastic nets collapse to the LASSO; at the other, they collapse to ridge regression. For the purpose of this notebook, we'll cut to the chase, move toward our preferred specification, and set $\alpha = 0$. We'll also inverse-probability-weight the classes to help out our classifier. (Without doing so, as we see below, it's tempted to just guess 'inactive' all the time because of the class imbalances.)
+
+### Just the LASSO
+```{r, lasso, fig.height=6, fig.width=6, cache=TRUE}
+Dx <- D %>% select(-c(Is.Orphan.,
+                      completionYear
+                      #API,
+                      #Operator.Number,
+                      #LEASE,
+                      #Field.Number
+                      ))
+NA2mean <- function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))
+Dxn <- Dx %>% select_if(is.numeric)
+Dxn <- replace(Dxn, TRUE, lapply(Dxn, NA2mean))
+Dxf <- Dx %>% select_if(is.factor)
+Dx <- cbind(Dxf,Dxn)
+Dx <- model.matrix(~.-1,Dx)
+
+# IPW classes
+Y <- D$Is.Orphan.
+f0 <- rep(1 - sum(Y == 0) / length(Y), sum(Y == 0))
+f1 <- rep(1 - sum(Y == 1) / length(Y), sum(Y == 1))
+weights <- numeric(length(Y))
+weights[Y == 0] <- f0
+weights[Y == 1] <- f1
+
+set.seed(253)
+m1l <- glmnet(Dx,Y,
+              family = 'binomial')
+plot(m1l, xvar = "dev", label = TRUE)
+set.seed(253)
+m1lw <- glmnet(Dx,Y,
+               family = 'binomial',
+               weights = weights)
+plot(m1lw, xvar = "dev", label = TRUE)
+
+# visualize lambda selection
+
+set.seed(206)
+m1lcv = cv.glmnet(Dx,Y,
+                  family = 'binomial',
+                  type.measure = "class",
+                  nfolds=5)
+plot(m1lcv)
+set.seed(206)
+m1lcvw = cv.glmnet(Dx,Y,
+                  family = 'binomial',
+                  type.measure = "class",
+                  nfolds=5,
+                  weights = weights)
+plot(m1lcvw)
+```
+There's definitely some learning going on, and correcting for the class imbalances helps (relatively speaking). Let's check the features/odds ratios for the selected model. First, we'll look at the unweighted model. The second table describes the weighted model.
+```{r, lasso coefs, cache=TRUE}
+tmp <- coef(m1lcv, s = "lambda.1se")
+coefs <- data.frame(name = tmp@Dimnames[[1]][tmp@i + 1],
+                   coefficient = tmp@x)
+coefs$odds.ratio <- exp(coefs$coefficient)
+coefs[,2:3] <- coefs[,2:3] %>% signif(digits = 5)
+
+coefs %>% datatable(
+  caption = 'Odds ratios >1 are predictive of orphan wells; odds ratios <1 are predictive of inactive wells')
+
+tmpw <- coef(m1lcvw, s = "lambda.1se")
+coefsw <- data.frame(name = tmpw@Dimnames[[1]][tmpw@i + 1],
+                   coefficient = tmpw@x)
+coefsw$odds.ratio <- exp(coefsw$coefficient)
+coefsw[,2:3] <- coefsw[,2:3] %>% signif(digits = 5)
+
+coefsw %>% datatable(
+  caption = 'Odds ratios >1 are predictive of orphan wells; odds ratios <1 are predictive of inactive wells. Classes were IPWed.')
+```
+### Testing
+
+Right. So there's some compelling stuff here, but we need to see if the learning is real. Let's drop 20 percent of our dataset, start over by re-running that cross-validation protocol, and test the model on the remaining data. We want to take a peek at the confusion matrices.
+```{r, glmnet confusion, cache=TRUE}
+set.seed(253)
+Dxtri = sample(seq(length(Y)),round(length(Y)*.8),replace=FALSE)
+m2lcvw = cv.glmnet(Dx[Dxtri,],Y[Dxtri],
+                  family = 'binomial',
+                  type.measure = "class",
+                  nfolds=5,
+                  weights = weights[Dxtri])
+cmatTest <- confusion.glmnet(m2lcvw,
+                             newx = Dx[-Dxtri,],
+                             newy = Y[-Dxtri],
+                             s = "lambda.1se")
+cmatTest
+```
+Alright, so that's a great sign. We're looking at `r 100*round(cmatTest[2,2]/sum(cmatTest[,2]),3)`% sensitivity and `r 100*round(cmatTest[1,1]/sum(cmatTest[,1]),3)`% specificity on an out-of-sample test. We're learning something! Let's go back to the full model we trained above and check out the confusion matrix.
+```{r, full model confusion}
+cmat <- confusion.glmnet(m1lcvw,
+                 newx = Dx,
+                 newy = Y, 
+                 s = "lambda.1se")
+cmat
+```
+Great! (I mean, terrifying, but you know what I mean.) By the way, for reference, here's what happens if you don't weight the classes:
+```{r, full model confusion unweighted}
+cmatnw <- confusion.glmnet(m1lcv,
+                 newx = Dx,
+                 newy = Y, 
+                 s = "lambda.1se")
+cmatnw
+```
+(As hinted at previously, it pretty much just guesses 'inactive' all the time. Easy way to hit 95 percent overall accuracy... and like 30 percent sensitivity.) Anyway, let's interrogate the weighted model a bit more. Right now, it's telling us that about `r cmat[2,1]` inactive wells are more or less indistinguishable from wells on the state's orphan well list. And yet... Texas doesn't considers these wells to be abandoned. So what differentiates them from the abandoned wells?
+
+```{r, ks tests, collapse=TRUE}
+Dpred <- D
+Dpred$predClass <- predict(m1lcvw,Dx,s="lambda.1se",type="class")
+PRED_ABAN <- Dpred[Dpred$predClass==TRUE & Dpred$Is.Orphan.==FALSE,]
+TRUE_ABAN <- Dpred[Dpred$Is.Orphan.==TRUE,]
+TRUE_INACTIVE <- Dpred[Dpred$Is.Orphan.==FALSE,]
+
+tests <- function(c1,c2){
+  ks <- ks.test(c1,c2)
+  m <- mood.test(c1,c2)
+  v <- var.test(c1,c2)
+  t <- t.test(c1,c2,var.equal=!v$p.value<.01)
+  return(list(ks,m,t))
+}
+
+cat("\n----------------")
+print("Age")
+print("New Predicted Abandoned Wells:")
+summary(PRED_ABAN$age)
+print("Current Ground-Truth Abandoned Wells:")
+summary(TRUE_ABAN$age)
+print("Current Ground-Truth Inactive Wells:")
+summary(TRUE_INACTIVE$age)
+ageTests <- tests(PRED_ABAN$age,TRUE_ABAN$age)
+
+cat("\n----------------")
+print("Organization Age")
+print("New Predicted Abandoned Wells:")
+summary(PRED_ABAN$orgAge)
+print("Current Ground-Truth Abandoned Wells:")
+summary(TRUE_ABAN$orgAge)
+print("Current Ground-Truth Inactive Wells:")
+summary(TRUE_INACTIVE$orgAge)
+orgAgeTests <- tests(PRED_ABAN$orgAge,TRUE_ABAN$orgAge)
+
+cat("\n----------------")
+print("Months Inactive")
+print("New Predicted Abandoned Wells:")
+summary(PRED_ABAN$inactiveTotalMonths)
+print("Current Ground-Truth Abandoned Wells:")
+summary(TRUE_ABAN$inactiveTotalMonths)
+print("Current Ground-Truth Inactive Wells:")
+summary(TRUE_INACTIVE$inactiveTotalMonths)
+inactiveTotalMonthsTests <- tests(PRED_ABAN$inactiveTotalMonths,TRUE_ABAN$inactiveTotalMonths)
+
+cat("\n----------------")
+print("Violation Count")
+print("New Predicted Abandoned Wells:")
+summary(PRED_ABAN$violationCount)
+print("Current Ground-Truth Abandoned Wells:")
+summary(TRUE_ABAN$violationCount)
+print("Current Ground-Truth Inactive Wells:")
+summary(TRUE_INACTIVE$violationCount)
+violationCountTests <- tests(PRED_ABAN$violationCount,TRUE_ABAN$violationCount)
+
+cat("\n----------------")
+print("Inspection Count")
+print("New Predicted Abandoned Wells:")
+summary(PRED_ABAN$inspectionCount)
+print("Current Ground-Truth Abandoned Wells:")
+summary(TRUE_ABAN$inspectionCount)
+print("Current Ground-Truth Inactive Wells:")
+summary(TRUE_INACTIVE$inspectionCount)
+inspectionCountTests <- tests(PRED_ABAN$inspectionCount,TRUE_ABAN$inspectionCount)
+
+cat("\n----------------")
+print("Financial Assurance (Dollars)")
+print("New Predicted Abandoned Wells:")
+summary(PRED_ABAN$FA.Amount)
+print("Current Ground-Truth Abandoned Wells:")
+summary(TRUE_ABAN$FA.Amount)
+print("Current Ground-Truth Inactive Wells:")
+summary(TRUE_INACTIVE$FA.Amount)
+FA.AmountTests <- tests(PRED_ABAN$FA.Amount,TRUE_ABAN$FA.Amount)
+
+cat("\n----------------")
+print("Well Depth")
+print("New Predicted Abandoned Wells:")
+summary(PRED_ABAN$API.Depth)
+print("Current Ground-Truth Abandoned Wells:")
+summary(TRUE_ABAN$API.Depth)
+print("Current Ground-Truth Inactive Wells:")
+summary(TRUE_INACTIVE$API.Depth)
+API.DepthTests <- tests(PRED_ABAN$API.Depth,TRUE_ABAN$API.Depth)
+```
+Basically, it appears to be the case that predicted abandoned wells look quite similar to ground-truth abandoned wells... except when it comes to the amount of time they've been inactive. (There's a median difference of about `r median(TRUE_ABAN$inactiveTotalMonths) - median(PRED_ABAN$inactiveTotalMonths)` months between the groups.) Our statistical tests aren't extraordinarily helpful with large sample sizes like these -- they'll err on the side of significant -- but take a look, for example, at the Kolmogorov-Smirnov test and Welch Two Sample t-test results for inactive time (p < `r inactiveTotalMonthsTests[[1]]$p.value` and `r inactiveTotalMonthsTests[[3]]$p.value`, respectively) and well depth (`r API.DepthTests[[1]]$p.value` and `r API.DepthTests[[3]]$p.value`). It's clear that the former represent a meaningful set of differences.
+\  
+This difference would appear to suggest a temporal understanding of the model -- that is, the predicted abandoned wells haven't ended up on the state's rolls because their operators aren't **yet** delinquent (or the wells haven't been inactive for **long enough** to be considered orphaned). But there's reason for concern. If it quacks like a duck...
+\  
+To understand this time horizon, let's just take a quick look at the past delinquency trajectories of operators with inactive wells.
+
+```{r, naive survival}
+DOP <- dI[(dI$Well.Plugged == "N"), ]
+DOP <- droplevels(DOP)
+DOP <- DOP %>% select(-Well.Plugged)
+DOP <- DOP %>% unique()
+# DOP$Operator.Number <- as.factor(DOP$Operator.Number)
+DOP$O.G.Code <- as.factor(DOP$O.G.Code)
+DOP$District.Code <- as.factor(DOP$District.Code)
+DOP$Water.Land.Code <- as.factor(DOP$Water.Land.Code)
+DOP$Org.Type <- as.factor(DOP$Org.Type)
+DOP$Mailing.Address.State <- as.factor(DOP$Mailing.Address.State)
+DOP$FA.Option <- as.factor(DOP$FA.Option)
+DOP$completionYear <- format(DOP$Original.Completion.Date, '%Y')
+DOP$age <- round(as.numeric(difftime("2020-10-03",
+                                     DOP$Original.Completion.Date,
+                                     units = "weeks") 
+                            / 52) # in years
+                 , 3)
+DOP <- DOP %>% select(-Original.Completion.Date)
+DOP$Last.P5.Filed.Date <- as.Date(DOP$Last.P5.Filed.Date, '%m/%d/%Y')
+DOP$Initial.P5.Filed.Date <-
+  as.Date(DOP$Initial.P5.Filed.Date, '%m/%d/%Y')
+DOP$Expiration.Date <- as.Date(DOP$Expiration.Date, '%m/%d/%Y')
+DOP$P5.Inactive.Date <- as.Date(DOP$P5.Inactive.Date, '%m/%d/%Y')
+DOP$orgAge <- round(as.numeric(difftime(DOP$Last.P5.Filed.Date,
+                                        DOP$Initial.P5.Filed.Date,
+                                        units = "weeks") 
+                               / 52) # in years
+                    , 3)
+DOP$orgDelinquentTotalMonths <-
+  round(as.numeric(difftime("2020-10-03",
+                            DOP$Expiration.Date,
+                            units = "weeks") 
+                   / 52) # in years
+        , 3) * 12 # in months
+DOP$Org.Type <-
+  factor(DOP$Org.Type, levels = c(levels(DOP$Org.Type), "OTHER"))
+DOP[grepl('OTHER', as.character(DOP$Org.Type)), 'Org.Type'] <- "OTHER"
+DOP <- droplevels(DOP)
+DOP$Mailing.Address.State <-
+  factor(DOP$Mailing.Address.State, levels = c(levels(DOP$Mailing.Address.State), "OTHER"))
+DOP$Mailing.Address.State <-
+  factor(ifelse(DOP$Mailing.Address.State == "TX", "TX", "OTHER"))
+summary(DOP$orgDelinquentTotalMonths)
+summary(DOP[DOP$Extension.Status == "D", ]$orgDelinquentTotalMonths)
+summary(DOP[DOP$Extension.Status == "A", ]$orgDelinquentTotalMonths)
+DOP$delinquent <- ifelse(DOP$Org.P5.Status == "DELINQUENT", 1, 0)
+summary(DOP$delinquent)
+DOP$monthsTilDelinquent <-
+  round(as.numeric(difftime(DOP$Expiration.Date,
+                            DOP$Initial.P5.Filed.Date,
+                            units = "weeks") 
+                   / 52) # in years
+        , 3) * 12 # in months
+DOP$monthsTilDelinquent <-
+  ifelse(DOP$delinquent == 1,
+         DOP$monthsTilDelinquent,
+         round(as.numeric(difftime("2020-10-03",
+                                   DOP$Initial.P5.Filed.Date,
+                                   units = "weeks") 
+                          / 52)
+               , 3) * 12)
+DOP <-
+  DOP %>% select(
+    Operator.Number,
+    County.Name,
+    O.G.Code,
+    District.Code,
+    API.Depth,
+    Cost.Calculation,
+    inspectionCount,
+    violationCount,
+    Org.Type,
+    Mailing.Address.State,
+    FA.Option,
+    FA.Amount,
+    age,
+    orgAge,
+    normcommod.3,
+    Unemployment.Rate.current,
+    interest.rate.current,
+    delinquent,
+    monthsTilDelinquent
+  )
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(totalViolations = sum(violationCount))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(totalInspections = sum(inspectionCount))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(totalDepth = sum(API.Depth))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(totalCost = sum(Cost.Calculation))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(totalFA = sum(FA.Amount))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(medianDepth = median(API.Depth))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(medianCost = median(Cost.Calculation))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(medianAge = median(age))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(medianCommod3 = median(normcommod.3))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(medianUnemp = median(Unemployment.Rate.current))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(medianIR = median(interest.rate.current))
+
+calculate_mode <- function(x) {
+  uniqx <- unique(na.omit(x))
+  uniqx[which.max(tabulate(match(x, uniqx)))]
+}
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(modeOG = calculate_mode(O.G.Code))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(modeCounty = calculate_mode(County.Name))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(modeDistrict = calculate_mode(District.Code))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(modeOT = calculate_mode(Org.Type))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(modeTX = calculate_mode(Mailing.Address.State))
+DOP <- DOP %>% group_by(Operator.Number) %>% mutate(modeFAType = calculate_mode(FA.Option))
+DOP <-
+  DOP %>% select(
+    Operator.Number,
+    Org.Type,
+    Mailing.Address.State,
+    orgAge,
+    delinquent,
+    monthsTilDelinquent,
+    totalViolations,
+    totalInspections,
+    totalCost,
+    totalFA,
+    medianDepth,
+    medianAge,
+    medianCommod3,
+    medianUnemp,
+    medianIR,
+    modeOG,
+    modeCounty,
+    modeDistrict,
+    modeFAType
+  )
+DOP <- DOP %>% ungroup() %>% select(-Operator.Number)
+DOP <- unique(DOP)
+n_distinct(dI$Operator.Number)
+nrow(DOP)
+
+# Kaplan-Meier plot
+s1o <-
+  survfit(Surv(monthsTilDelinquent, delinquent) ~ 1, data = DOP)
+ggsurvplot(fit = s1o,
+           xlab = "Months",
+           ylab = "Overall survival probability")
+
+# for reference, some K-M plots from the whole dataset
+s1 <- survfit(Surv(inactiveTotalMonths, Is.Orphan.) ~ 1, data = D)
+ggsurvplot(fit = s1o,
+           xlab = "Months",
+           ylab = "Overall survival probability")
+
+s2 <- survfit(Surv(age, Is.Orphan.) ~ 1, data = D)
+ggsurvplot(fit = s2,
+           xlab = "Years old",
+           ylab = "Overall survival probability")
+
+s1OT <- survfit(Surv(inactiveTotalMonths, Is.Orphan.) ~ Org.Type, data = D)
+ggsurvplot(fit = s1OT,
+           xlab = "Months inactive",
+           ylab = "Overall survival probability",
+           legend = "right")
+
+s1OS <- survfit(Surv(inactiveTotalMonths, Is.Orphan.) ~ Mailing.Address.State, data = D)
+ggsurvplot(fit = s1OS,
+           xlab = "Months inactive",
+           ylab = "Overall survival probability",
+           legend = "right")
+
+b <- c(-Inf, 2, 5, Inf)
+bnames <- c("<2", "2-4", "5+")
+D$inspectionBin <- cut(D$inspectionCount, breaks = b, labels = bnames)
+
+s1IC <- survfit(Surv(inactiveTotalMonths, Is.Orphan.) ~ inspectionBin, data = D)
+ggsurvplot(fit = s1IC,
+           xlab = "Months inactive",
+           ylab = "Overall survival probability",
+           legend = "right")
+
+b <- c(-Inf, 2, 5, Inf)
+bnames <- c("<2", "2-4", "5+")
+D$violationBin <- cut(D$violationCount, breaks = b, labels = bnames)
+
+s1VC <- survfit(Surv(inactiveTotalMonths, Is.Orphan.) ~ violationBin, data = D)
+ggsurvplot(fit = s1VC,
+           xlab = "Months inactive",
+           ylab = "Overall survival probability",
+           legend = "right")
+
+b <- c(-Inf, 2, 5, Inf)
+bnames <- c("<2", "2-4", "5+")
+D$nOperatorsBin <- cut(D$nOperators, breaks = b, labels = bnames)
+
+s1OC <- survfit(Surv(inactiveTotalMonths, Is.Orphan.) ~ nOperatorsBin, data = D)
+ggsurvplot(fit = s1OC,
+           xlab = "Months inactive",
+           ylab = "Overall survival probability",
+           legend = "right")
+
+b <- c(-Inf, 2, 10, 20, 30, 40, Inf)
+bnames <- c("<2", "2-9", "10-19", "20-29", "30-39", "40+")
+D$orgAgeBin <- cut(D$orgAge, breaks = b, labels = bnames)
+
+s1OAB <- survfit(Surv(inactiveTotalMonths, Is.Orphan.) ~ orgAgeBin, data = D)
+ggsurvplot(fit = s1OAB,
+           xlab = "Months inactive",
+           ylab = "Overall survival probability",
+           legend = "right")
+```
+The important chart up there is the first one. Indeed, it looks like around 10 percent of operators with inactive wells wind up delinquent after about 50 months.
+
+## New Mexico replication
+
+Not much to add here! I've condensed some of the above steps into one long block below.
+```{r, new mexico, cache=TRUE}
+macro <- read.csv('../data/macro.csv')
+unemployment <- read.csv('../data/NM/county/unemployment.csv')
+mappings <- read.csv('../data/NM/county/mappings.csv')
+inspections <- read.csv('../data/NM/well/ic.csv',
+                        stringsAsFactors = FALSE)
+inactive <- read.csv('../data/NM/well/inactive.csv',
+                     stringsAsFactors = FALSE)
+operators <- read.csv('../data/NM/operator/operator.csv',
+                     stringsAsFactors = FALSE)
+bonding <- read.csv('../data/NM/operator/bonding.csv',
+                     stringsAsFactors = FALSE)
+abandoned <- read.csv('../data/NM/well/abandoned.csv',
+                     stringsAsFactors = FALSE)
+abandoned <- abandoned %>% select(API)
+
+inactive$Last.Production <- as.Date(inactive$Last.Production, "%m/%d/%y")
+inactive <- inactive[inactive$Last.Production <= "2019-06-01",] #2019-06-01 for TX mapping?
+
+unemployment$Areaname <- unemployment$Areaname %>% trimws()
+wup <- unemployment %>% filter(Areatype==4)
+wup <- wup %>% select(Areaname,
+                      Periodyear,
+                      Laborforce,
+                      Unemprate)
+wup$Area <- as.factor(wup$Areaname)
+wup <- wup[!duplicated(wup[c(1,2)]),]
+wup <- wup %>% group_by(Areaname) %>% mutate(Laborforce.Change = (Laborforce - lag(Laborforce))/lag(Laborforce))  
+
+macro$date <- as.Date(macro$date, "%m/%d/%y")
+macro$Year <- format(macro$date,"%Y") %>% as.integer()
+macroAll <- wup %>% merge(macro,
+                          by.x = "Periodyear",
+                          by.y = "Year",
+                          all.x = TRUE) # unique rows are county-month pairs
+inactive <- inactive[inactive$API != "",]
+inactive$Is.Orphan. <- ifelse(inactive$API %in% unique(abandoned$API), TRUE, FALSE)
+
+apiList <- unique(inactive$API) # 4,467 entries
+inspections <- inspections %>% subset(API %in% apiList) # 4,466 rows
+inactive <- inactive %>% merge(inspections, by = "API")
+inactive$inactiveTotalMonths <- as.integer((as.Date("2020-06-01") - inactive$Last.Production.x)/(365.25/12))
+inactive$Original.Completion.Date <- as.Date(as.character(inactive$Spud.Date), #spud for NM
+                                             "%Y-%m-%d")
+dI <- inactive
+dI$inspectionCount <- dI$InspectionsPerWell
+dI$violationCount <- dI$IncidentsPerWell #i.e. actually incidents for NM
+dI$violationCount2 <- dI$SpillsPerWell #i.e. actually spills for NM
+
+dI <- dI %>% merge(operators,
+                   by = "Ogrid",
+                   all.x = TRUE)
+dI <- dI %>% merge(bonding,
+                   by = "API",
+                   all.x = TRUE)
+
+macroAll$Area <- gsub("Do\xf1a Ana County","Dona Ana County",macroAll$Area)
+macroAll$Area <- tolower(macroAll$Area) %>% trimws() %>% as.factor()
+macroAll$Area <- gsub(" county","",macroAll$Area)
+
+mappings$county <- tolower(mappings$county) %>% trimws() %>% as.factor()
+mappings$code <- frmt(mappings,"code",3)
+dI$County <- substr(dI$API,4,6)
+dI <- dI %>% merge(mappings,by.x="County",by.y = "code")
+dI$County.Name <- tolower(dI$county) %>% trimws() %>% as.factor()
+
+macroAll <- macroAll %>% merge(mappings,
+                                by.x = "Area",
+                                by.y = "county",
+                                all.x = TRUE)
+macroAll <- macroAll %>% select(-c(Areaname,code,Periodyear))
+
+dI$inactiveDate <- dI$Last.Production.x
+dI$inactiveDate3 <- dI$inactiveDate %m-% months(3)
+dI$inactiveDate6 <- dI$inactiveDate %m-% months(6)
+dI$inactiveDate12 <- dI$inactiveDate %m-% months(12)
+dI$inactiveDate18 <- dI$inactiveDate %m-% months(18)
+dI$inactiveDate24 <- dI$inactiveDate %m-% months(24)
+
+dI$inactiveDate3p <- dI$inactiveDate %m+% months(3)
+dI$inactiveDate6p <- dI$inactiveDate %m+% months(6)
+dI$inactiveDate12p <- dI$inactiveDate %m+% months(12)
+
+renames <- 7
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"current")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate3","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"3")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate6","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"6")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate12","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"12")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate18","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"18")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate24","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"24")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate3p","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"3p")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate6p","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"6p")
+
+dI <- dI %>% merge(macroAll,
+                   by.x = c("inactiveDate12p","County.Name"),
+                   by.y = c("date","Area"),
+                   all.x = TRUE)
+dI <- rn(dI,renames,"12p")
+
+# dI <- dI %>% mutate(totprod = scale(sumOil)+scale(sumGas))
+dI <- dI %>% mutate(normcommod.current = ifelse(Type=="Gas",scale(ng.price.current),scale(wti.price.current)))
+dI <- dI %>% mutate(normcommod.3 = ifelse(Type=="Gas",scale(ng.price.3),scale(wti.price.3)))
+dI <- dI %>% mutate(normcommod.6 = ifelse(Type=="Gas",scale(ng.price.6),scale(wti.price.6)))
+dI <- dI %>% mutate(normcommod.12 = ifelse(Type=="Gas",scale(ng.price.12),scale(wti.price.12)))
+dI <- dI %>% mutate(normcommod.18 = ifelse(Type=="Gas",scale(ng.price.18),scale(wti.price.18)))
+dI <- dI %>% mutate(normcommod.24 = ifelse(Type=="Gas",scale(ng.price.24),scale(wti.price.24)))
+dI <- dI %>% mutate(normcommod.3p = ifelse(Type=="Gas",scale(ng.price.3p),scale(wti.price.3p)))
+dI <- dI %>% mutate(normcommod.6p = ifelse(Type=="Gas",scale(ng.price.6p),scale(wti.price.6p)))
+dI <- dI %>% mutate(normcommod.12p = ifelse(Type=="Gas",scale(ng.price.12p),scale(wti.price.12p)))
+
+dI <- droplevels(dI)
+rownames(dI) <- NULL
+
+dI <- dI %>% select(
+                    API,
+                    Ogrid.x,
+                    County.Name,
+                    Type,
+                    District.x,
+                    # LEASE,
+                    # Field.Number,
+                    OCD.Unit,
+                    Lease.Type.x,
+                    Mineral.Owner,
+                    Measured.Depth,
+                    Elevation,
+                    Plugged.On,
+                    # Extension.Status,
+                    # Cost.Calculation,
+                    # Well.Plugged,
+                    Spud.Date,
+                    Is.Orphan.,
+                    inactiveTotalMonths,
+                    inspectionCount,
+                    violationCount,
+                    violationCount2,
+                    X5.9.Compliance.x,
+                    Well.Count.x,
+                    Inactive.Wells.x,
+                    # Org.Type,
+                    # Mailing.Address.State,
+                    # Initial.P5.Filed.Date,
+                    # Last.P5.Filed.Date,
+                    # Expiration.Date,
+                    # P5.Inactive.Date,
+                    Required.Bond.Amount,
+                    Bond.In.Place,
+                    Bond.Required.Now,
+                    Covered.By.Blanket.TA.Bond,
+                    In.Violation,
+                    # nOperators,
+                    # sumOil,
+                    # sumGas,
+                    # totprod,
+                    # Firms.current,
+                    # Average.Weekly.Wage.current,
+                    Unemprate.current,
+                    Laborforce.current,
+                    Laborforce.Change.current,
+                    wti.price.current,
+                    ng.price.current,
+                    interest.rate.current,
+                    interest.rate.change.current,
+                    wti.price.3,
+                    ng.price.3,
+                    wti.price.6,
+                    ng.price.6,
+                    wti.price.12,
+                    ng.price.12,
+                    wti.price.18,
+                    ng.price.18,
+                    wti.price.24,
+                    ng.price.24,
+                    interest.rate.12,
+                    interest.rate.change.12,
+                    interest.rate.18,
+                    interest.rate.change.18,
+                    interest.rate.24,
+                    interest.rate.change.24,
+                    wti.price.3p,
+                    ng.price.3p,
+                    wti.price.6p,
+                    ng.price.6p,
+                    wti.price.12p,
+                    ng.price.12p,
+                    interest.rate.6p,
+                    interest.rate.change.6p,
+                    interest.rate.12p,
+                    interest.rate.change.12p,
+                    # Firms.12,
+                    # Average.Weekly.Wage.12,
+                    Unemprate.12,
+                    Laborforce.12,
+                    Laborforce.Change.12,
+                    # Firms.24,
+                    # Average.Weekly.Wage.24,
+                    Unemprate.24,
+                    Laborforce.24,
+                    Laborforce.Change.24,
+                    # Firms.12p,
+                    # Average.Weekly.Wage.12p,
+                    Unemprate.12p,
+                    Laborforce.12p,
+                    Laborforce.Change.12p,
+                    normcommod.current,
+                    normcommod.3,
+                    normcommod.6,
+                    normcommod.12,
+                    normcommod.18,
+                    normcommod.24,
+                    normcommod.3p,
+                    normcommod.6p,
+                    normcommod.12p
+                    )
+
+dIs <- dI %>% select(
+                    Is.Orphan.,
+                    API,
+                    Ogrid.x,
+                    County.Name,
+                    Type,
+                    District.x,
+                    # OCD.Unit,
+                    Lease.Type.x,
+                    Mineral.Owner,
+                    Measured.Depth,
+                    Elevation,
+                    Spud.Date,
+                    inactiveTotalMonths,
+                    inspectionCount,
+                    violationCount,
+                    violationCount2,
+                    X5.9.Compliance.x,
+                    Well.Count.x,
+                    Inactive.Wells.x,
+                    Required.Bond.Amount,
+                    Bond.In.Place,
+                    Bond.Required.Now,
+                    Covered.By.Blanket.TA.Bond,
+                    In.Violation,
+                    Unemprate.current,
+                    Laborforce.current,
+                    Laborforce.Change.current,
+                    wti.price.current,
+                    ng.price.current,
+                    interest.rate.current,
+                    interest.rate.change.current,
+                    # wti.price.3,
+                    # ng.price.3,
+                    # wti.price.6,
+                    # ng.price.6,
+                    # wti.price.12,
+                    # ng.price.12,
+                    # wti.price.18,
+                    # ng.price.18,
+                    # wti.price.24,
+                    # ng.price.24,
+                    interest.rate.12,
+                    interest.rate.change.12,
+                    interest.rate.18,
+                    interest.rate.change.18,
+                    interest.rate.24,
+                    interest.rate.change.24,
+                    # wti.price.3p,
+                    # ng.price.3p,
+                    # wti.price.6p,
+                    # ng.price.6p,
+                    # wti.price.12p,
+                    # ng.price.12p,
+                    interest.rate.6p,
+                    interest.rate.change.6p,
+                    interest.rate.12p,
+                    interest.rate.change.12p,
+                    Unemprate.12,
+                    Laborforce.12,
+                    Laborforce.Change.12,
+                    Unemprate.24,
+                    Laborforce.24,
+                    Laborforce.Change.24,
+                    Unemprate.12p,
+                    Laborforce.12p,
+                    Laborforce.Change.12p,
+                    normcommod.current,
+                    normcommod.3,
+                    normcommod.6,
+                    normcommod.12,
+                    normcommod.18,
+                    normcommod.24,
+                    normcommod.3p,
+                    normcommod.6p,
+                    normcommod.12p
+                    )
+
+TX <- D # stash TX here
+D <- dIs %>% unique()
+
+# D$Operator.Number <- as.factor(D$Operator.Number)
+D$Type <- as.factor(D$Type)
+D$Ogrid.x <- as.factor(D$Ogrid.x)
+D$District.x <- as.factor(D$District.x)
+D$Lease.Type.x <- as.factor(D$Lease.Type.x)
+D$Mineral.Owner <- as.factor(D$Mineral.Owner)
+D$X5.9.Compliance.x <- as.factor(D$X5.9.Compliance.x)
+D$Bond.Required.Now <- as.factor(D$Bond.Required.Now)
+D$Covered.By.Blanket.TA.Bond <- as.factor(D$Covered.By.Blanket.TA.Bond)
+D$In.Violation <- as.factor(D$In.Violation)
+
+D$Required.Bond.Amount <- as.numeric(D$Required.Bond.Amount)
+
+D$completionYear <- format(as.Date(D$Spud.Date),'%Y')
+D$age <- round(as.numeric(difftime("2020-06-01",
+                                   as.Date(D$Spud.Date),
+                                   units="weeks")/52) # in years
+               ,3) 
+D <- D %>% select(-Spud.Date)
+D <- droplevels(D)
+
+Dx <- D %>% select(-c(Is.Orphan.,
+                      completionYear,
+                      API,
+                      Ogrid.x,
+                      Bond.Required.Now,
+                      Covered.By.Blanket.TA.Bond,
+                      In.Violation,
+                      County.Name
+                      # inactiveTotalMonths,
+                      # LEASE,
+                      # Field.Number,
+                      ))
+Dxn <- Dx %>% select_if(is.numeric)
+Dxn <- replace(Dxn, TRUE, lapply(Dxn, NA2mean))
+Dxf <- Dx %>% select_if(is.factor)
+Dx <- cbind(Dxf,Dxn)
+Dx <- model.matrix(~.-1,Dx)
+
+# IPW classes
+Y <- D$Is.Orphan.
+f0 <- rep(1 - sum(Y == 0) / length(Y), sum(Y == 0))
+f1 <- rep(1 - sum(Y == 1) / length(Y), sum(Y == 1))
+weights <- numeric(length(Y))
+weights[Y == 0] <- f0
+weights[Y == 1] <- f1
+
+# visualize lambda selection
+set.seed(206)
+m1lcvwnm = cv.glmnet(Dx,Y,
+                  family = 'binomial',
+                  type.measure = "class",
+                  nfolds=5,
+                  weights = weights)
+plot(m1lcvwnm)
+
+set.seed(763)
+Dxtri = sample(seq(length(Y)),round(length(Y)*.8),replace=FALSE)
+m2lcvwnm = cv.glmnet(Dx[Dxtri,],Y[Dxtri],
+                  family = 'binomial',
+                  type.measure = "class",
+                  nfolds=5,
+                  weights = weights[Dxtri])
+confusion.glmnet(m2lcvwnm,
+                 newx = Dx[-Dxtri,],
+                 newy = Y[-Dxtri],
+                 s = "lambda.1se")
+
+confusion.glmnet(m1lcvwnm,
+                 newx = Dx,
+                 newy = Y,
+                 s = "lambda.1se")
+
+tmpw <- coef(m1lcvwnm, s = "lambda.1se")
+coefsw <- data.frame(name = tmpw@Dimnames[[1]][tmpw@i + 1],
+                   coefficient = tmpw@x)
+coefsw$odds.ratio <- exp(coefsw$coefficient)
+coefsw[,2:3] <- coefsw[,2:3] %>% signif(digits = 5)
+
+coefsw %>% datatable(
+  caption = 'Odds ratios >1 are predictive of orphan wells; odds ratios <1 are predictive of inactive wells. Classes were IPWed.')
+```
+## Addendum
+
+And a quick figure to examine the effect of oil prices on aggregate annual abandonment rates:
+```{r, agg oil plot,fig.height=7, fig.width=5}
+library(segmented)
+setwd("~/Developer/gristy/abandoned-wells/src")
+style <- "grist"
+source("gristify.R")
+
+macro <- read.csv('../data/macro.csv')
+macro$date <- as.Date(macro$date, "%m/%d/%y")
+macro$Year <- format(macro$date,"%Y") %>% as.integer()
+
+cpi <- read.csv('../data/CPI-to-1999.csv') %>% dplyr::select(ipums_match,cpi)
+cpi$ipums_match <- as.character(cpi$ipums_match)
+macro <- macro %>% merge(cpi,
+                   by.x = "Year",
+                   by.y = "ipums_match")
+macro$wti.price <- macro$wti.price * macro$cpi * 1.535 # i.e. to 2019 dollars (use 1.507 for 2018)
+
+tx <- read.csv('../data/TX/well/IWAR_20201003.csv',
+                     stringsAsFactors = FALSE)
+tx$inactiveTotalMonths <- (tx$Current.Inactive.Years * 12) + 
+  tx$Current.Inactive.Months
+tx$inactiveDate <- as.Date("2020/10/01") %m-% months(tx$inactiveTotalMonths)
+tx <- tx %>% select(O.G.Code,inactiveDate,Is.Orphan.) %>% mutate(state="TX")
+names(tx) <- c("Type","inactiveDate","Is.Orphan.","state")
+
+nm <- read.csv('../data/NM/well/inactive.csv',
+                     stringsAsFactors = FALSE)
+nm$Last.Production <- as.Date(nm$Last.Production, "%m/%d/%y")
+nm <- nm[nm$Last.Production <= "2019-06-01",]
+nm <- nm[nm$API != "",]
+nm$Is.Orphan. <- ifelse(nm$API %in% unique(abandoned$API), TRUE, FALSE)
+nm$inactiveTotalMonths <- as.integer((as.Date("2020-06-01") - 
+                                        nm$Last.Production)/(365.25/12))
+nm$inactiveDate <- as.Date("2020/06/01") %m-% months(nm$inactiveTotalMonths)
+nm <- nm %>% select(Well.Type,inactiveDate,Is.Orphan.) %>% mutate(state="NM")
+names(nm) <- c("Type","inactiveDate","Is.Orphan.","state")
+
+txnm <- rbind(tx,nm)
+txnm <- txnm %>% filter(Type %in% c("O","G"))
+txnm <- txnm %>% merge(macro,
+                       by.x = c("inactiveDate"),
+                       by.y = c("date"),
+                       all.x = TRUE)
+txnm <- txnm %>% filter(inactiveDate >= as.Date("1998-01-01"))
+
+txnm$inactiveYear <- format(txnm$inactiveDate,'%Y')
+txnm <- txnm %>% 
+  group_by(inactiveYear) %>% 
+  mutate(meanWTI = mean(wti.price,na.rm=TRUE)) %>% 
+  ungroup()
+txnm <- txnm %>% 
+  group_by(inactiveYear,
+           Type
+           ) %>% 
+  mutate(iO = mean(Is.Orphan.,na.rm=TRUE)) %>% 
+  ungroup()
+
+prices <- txnm %>% select(meanWTI,
+                          iO,
+                          inactiveYear,
+                          Type
+                          ) %>% unique()
+prices <- prices %>% filter(iO <= 0.4)
+
+my.seg <- segmented(lm(iO ~ meanWTI, data = prices),
+                    seg.Z = ~ meanWTI,
+                    psi = 75)
+
+title <- "Inflection point"
+subtitle <- "Annual rates of well abandonment rise \nwith falling oil prices"
+caption <- "Source: Grist and Texas Observer analysis of Texas, New Mexico, and federal data. \nOil prices are adjusted for inflation to 2019 dollars."
+xLab <- "Average oil price when wells stopped producing"
+yLab <- "Yearly statewide abandonment rate"
+
+yAxisBreaks <- seq(0, .2, by=.05) #seq(-10, 30, by=5)
+yAxisLabels <- paste0(yAxisBreaks*100,"%")
+yAxisLimits <- c(-.01,max(yAxisBreaks)* 1.03)
+
+xAxisBreaks <- seq(25, 100, by = 25)
+xAxisLabels <- paste0("$",xAxisBreaks)
+xAxisLimits <- c(min(xAxisBreaks)*.95,max(xAxisBreaks)* 1.05)
+
+ggplot(prices,
+       aes(x = meanWTI,
+           y = iO,
+           color = Type
+           )) + 
+  geom_point() + 
+  geom_smooth(method = "loess", se=FALSE) +
+  scale_x_continuous(labels=xAxisLabels, expand = c(0, 0), breaks=xAxisBreaks, limits=xAxisLimits) +
+  scale_y_continuous(labels=yAxisLabels, expand = c(0, 0), breaks=yAxisBreaks, limits=yAxisLimits) +
+  
+  labs(x=xLab, y=yLab, title=title, subtitle=subtitle, 
+       caption=caption) +
+  geom_vline(xintercept = my.seg$psi[2],linetype="dashed") +
+  
+  theme_minimal() + gristify()
+```
+```{r, session info}
+sessionInfo()
+```
+
+\
+<div class="tocify-extend-page" data-unique="tocify-extend-page" style="height: 0;"></div>
