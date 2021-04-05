@@ -5,7 +5,7 @@ This repository contains data and code to accompany the Grist and Texas Observer
 The main file is `src/abandoned-wells.rmd`. This notebook has also been rendered as an HTML file for easier viewing (`abandoned-wells.html`).  
   
 Two datasets exceed the size limit of GitHub's standard file-storage policy and must be downloaded separately. (Note that for this reason, these files appear in the `.gitignore` file.) They are:  
-1. [This dataset](), called `OG_LEASE_CYCLE_DATA_TABLE.dsv`, which should be placed in `data/TX/lease/PDQ/`, and
+1. [This dataset](https://drive.google.com/file/d/1-ExCcacgke0rO0tkRJk3XtCQwJD1oF5e/view?usp=sharing), called `OG_LEASE_CYCLE_DATA_TABLE.dsv`, which should be placed in `data/TX/lease/PDQ/`, and
 2. [This dataset](https://drive.google.com/file/d/106dUPDX-qYZu1oDksbRXpIg6l19uszxc/view?usp=sharing), called `ic.csv`, which should be placed in `data/TX/well/`.  
   
 Questions? Email [caldern@grist.org](mailto:caldern@grist.org) or reach out [on Twitter](https://twitter.com/compatibilism).
